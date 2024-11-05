@@ -159,6 +159,7 @@ public:
   void finish() override;
 
 private:
+  bool extractSourceRange(const NamedDecl &ND, Symbol &S);
   const Symbol *addDeclaration(const NamedDecl &, SymbolID,
                                bool IsMainFileSymbol);
   void addDefinition(const NamedDecl &, const Symbol &DeclSymbol,

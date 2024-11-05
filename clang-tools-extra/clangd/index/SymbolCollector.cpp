@@ -41,6 +41,7 @@
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
+#include "llvm/Support/Base64.h"
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/FileSystem.h"
@@ -50,10 +51,40 @@
 #include <optional>
 #include <string>
 #include <utility>
+#include <resolv.h>
 
 namespace clang {
 namespace clangd {
 namespace {
+class DeclPrinter {
+public:
+  static clang::PrintingPolicy createStandardPolicy(const ASTContext &Context) {
+    clang::PrintingPolicy Policy(Context.getLangOpts());
+    Policy.SuppressScope = false;
+    Policy.FullyQualifiedName = true;
+    Policy.SuppressSpecifiers = false;
+    Policy.PrintCanonicalTypes = false;
+    Policy.IncludeNewlines = false;
+    Policy.UsePreferredNames = true;
+    Policy.SuppressInitializers = false;
+    Policy.SuppressInlineNamespace = clang::PrintingPolicy::SuppressInlineNamespaceMode::None;
+    Policy.Nullptr = true;
+    Policy.NullptrTypeInNamespace = true;
+    return Policy;
+  }
+
+  static std::string toString(const NamedDecl* ND) {
+    if (!ND) return "";
+    
+    std::string Result;
+    llvm::raw_string_ostream OS(Result);
+    
+    auto Policy = createStandardPolicy(ND->getASTContext());
+    
+    ND->print(OS, Policy);
+    return OS.str();
+  }
+};
 
 /// If \p ND is a template specialization, returns the described template.
 /// Otherwise, returns \p ND.
@@ -1031,6 +1062,107 @@ void SymbolCollector::finish() {
   FilesWithObjCConstructs.clear();
 }
 
+std::string extractRealBody(const SymbolLocation &Loc, const ASTContext &Context) {
+  const SourceManager &SM = Context.getSourceManager();
+
+  // Parse URI and resolve absolute path
+  auto URI = clang::clangd::URI::parse(Loc.FileURI);
+  if (!URI) return "";
+
+  auto AbsPathOrErr = clang::clangd::URI::resolve(*URI, /*HintPath=*/"");
+  if (!AbsPathOrErr) return "";
+
+  // Retrieve file reference
+  auto &FileMgr = SM.getFileManager();
+  auto FileOrErr = FileMgr.getFileRef(*AbsPathOrErr);
+  if (!FileOrErr) return "";
+
+  FileID FID = SM.translateFile(*FileOrErr);
+  if (!FID.isValid()) return "";
+
+  bool Invalid = false;
+  StringRef Buffer = SM.getBufferData(FID, &Invalid);
+  if (Invalid || Buffer.empty()) return "";
+
+  // Check if location has valid line and column values
+  if (Loc.Start.line() == 0 && Loc.Start.column() == 0 && Loc.End.line() == 0 && Loc.End.column() == 0) {
+      return ""; // Return empty string if any location has zeros
+  }
+
+  // Convert position to SourceLocation
+  SourceLocation StartLoc = SM.translateLineCol(FID, Loc.Start.line() + 1, Loc.Start.column() + 1);
+  SourceLocation EndLoc = SM.translateLineCol(FID, Loc.End.line() + 1, Loc.End.column() + 1);
+
+  // Ensure valid locations
+  if (StartLoc.isInvalid() || EndLoc.isInvalid()) return "";
+
+  // Calculate start and end offsets
+  unsigned StartOffset = SM.getFileOffset(StartLoc);
+  unsigned EndOffset = SM.getFileOffset(EndLoc);
+
+  // Validate offsets
+  if (StartOffset >= Buffer.size() || EndOffset > Buffer.size() || StartOffset >= EndOffset) return "";
+
+  // Extract the slice between start and end offsets
+  return std::string(Buffer.substr(StartOffset, EndOffset - StartOffset));
+}
+
+
+bool SymbolCollector::extractSourceRange(const NamedDecl &ND, Symbol &S) {
+  const SourceManager &SM = ND.getASTContext().getSourceManager();
+
+  // Get the initial source range
+  SourceRange DefRange = ND.getSourceRange();
+  SourceLocation StartLoc = DefRange.getBegin();
+  SourceLocation EndLoc = DefRange.getEnd();
+
+  // Traverse macro expansions to find where the macro is expanded
+  if (StartLoc.isMacroID()) {
+    StartLoc = SM.getExpansionLoc(StartLoc);
+  }
+  if (EndLoc.isMacroID()) {
+    EndLoc = SM.getExpansionRange(EndLoc).getEnd();  // Use the end of the expansion range
+  }
+
+  // Adjust StartLoc and EndLoc using Lexer to ensure they are at the correct token positions
+  StartLoc = clang::Lexer::GetBeginningOfToken(StartLoc, SM, ND.getASTContext().getLangOpts());
+  EndLoc = clang::Lexer::getLocForEndOfToken(EndLoc, 0, SM, ND.getASTContext().getLangOpts());
+
+  // Fallback to spelling locations if needed
+  if (!StartLoc.isValid()) {
+    StartLoc = SM.getSpellingLoc(DefRange.getBegin());
+  }
+  if (!EndLoc.isValid()) {
+    EndLoc = SM.getSpellingLoc(DefRange.getEnd());
+  }
+
+  // Ensure StartLoc and EndLoc are within the same file and adjust the range
+  if (StartLoc.isValid() && EndLoc.isValid() && SM.isInFileID(StartLoc, SM.getFileID(EndLoc))) {
+    auto StartTokenLoc = getTokenLocation(StartLoc);
+    if (StartTokenLoc) {
+      S.FullLocation = *StartTokenLoc;
+
+      // Retrieve and set the FileURI from the SourceManager
+      if (const auto *FE = SM.getFileEntryForID(SM.getFileID(StartLoc))) {
+          std::string PersistentURI = "file://" + FE->tryGetRealPathName().str();
+          S.FullLocation.FileURI = strdup(PersistentURI.c_str()); // Dynamically allocated copy
+      }
+
+      auto EndTokenLoc = getTokenLocation(EndLoc);
+      if (EndTokenLoc) {
+          S.FullLocation.End = EndTokenLoc->End;
+          return true; // Success
+      }
+      llvm::errs() << "Warning: EndTokenLoc is not valid\n";
+    } else {
+      llvm::errs() << "Warning: StartTokenLoc is not valid\n";
+    }
+  } else {
+    llvm::errs() << "Warning: StartLoc or EndLoc is not valid or not in the same file\n";
+  }
+  return false;
+}
+
 const Symbol *SymbolCollector::addDeclaration(const NamedDecl &ND, SymbolID ID,
                                               bool IsMainFileOnly) {
   auto &Ctx = ND.getASTContext();
@@ -1064,6 +1196,12 @@ const Symbol *SymbolCollector::addDeclaration(const NamedDecl &ND, SymbolID ID,
   S.Origin = Opts.Origin;
   if (ND.getAvailability() == AR_Deprecated)
     S.Flags |= Symbol::Deprecated;
+
+  if (S.RealBody.empty() && extractSourceRange(ND, S))
+    S.RealBody = extractRealBody(S.FullLocation, ND.getASTContext());
+
+  if (S.Body.empty())
+    S.Body = DeclPrinter::toString(&ND);
 
   // Add completion info.
   // FIXME: we may want to choose a different redecl, or combine from several.
@@ -1117,7 +1255,7 @@ const Symbol *SymbolCollector::addDeclaration(const NamedDecl &ND, SymbolID ID,
   if (S.SymInfo.Lang == index::SymbolLanguage::ObjC)
     FilesWithObjCConstructs.insert(FID);
   return Symbols.find(S.ID);
-}
+} 
 
 void SymbolCollector::addDefinition(const NamedDecl &ND, const Symbol &DeclSym,
                                     bool SkipDocCheck) {
@@ -1125,6 +1263,7 @@ void SymbolCollector::addDefinition(const NamedDecl &ND, const Symbol &DeclSym,
     return;
   const auto &SM = ND.getASTContext().getSourceManager();
   auto Loc = nameLocation(ND, SM);
+
   shouldIndexFile(SM.getFileID(Loc));
   auto DefLoc = getTokenLocation(Loc);
   // If we saw some forward declaration, we end up copying the symbol.
@@ -1135,6 +1274,11 @@ void SymbolCollector::addDefinition(const NamedDecl &ND, const Symbol &DeclSym,
   Symbol S = DeclSym;
   // FIXME: use the result to filter out symbols.
   S.Definition = *DefLoc;
+
+  if (extractSourceRange(ND, S))
+    S.RealBody = extractRealBody(S.FullLocation, ND.getASTContext());
+
+  S.Body = DeclPrinter::toString(&ND);
 
   std::string DocComment;
   std::string Documentation;

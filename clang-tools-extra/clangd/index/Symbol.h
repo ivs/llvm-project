@@ -87,6 +87,10 @@ struct Symbol {
   /// Only set when the symbol is indexed for completion.
   llvm::StringRef Type;
 
+  SymbolLocation FullLocation;
+  std::string Body;
+  std::string RealBody;
+
   enum IncludeDirective : uint8_t {
     Invalid = 0,
     /// `#include "header.h"`

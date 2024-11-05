@@ -23,6 +23,7 @@
 #include "llvm/Support/Error.h"
 #include "llvm/Support/raw_ostream.h"
 #include <cstdint>
+#include <sstream>
 #include <vector>
 
 namespace clang {
@@ -676,7 +677,13 @@ void writeRIFF(const IndexFileOut &Data, llvm::raw_ostream &OS) {
 
 // Defined in YAMLSerialization.cpp.
 void writeYAML(const IndexFileOut &, llvm::raw_ostream &);
+void writeTSV(const IndexFileOut &O, llvm::raw_ostream &OSSymbols, llvm::raw_ostream &OSRefs, llvm::raw_ostream &OSRelations);
 llvm::Expected<IndexFileIn> readYAML(llvm::StringRef, SymbolOrigin Origin);
+std::error_code EC;
+llvm::raw_fd_ostream OSSymbols("symbols.tsv", EC, llvm::sys::fs::OF_Text);
+llvm::raw_fd_ostream OSRefs("refs.tsv", EC, llvm::sys::fs::OF_Text);
+llvm::raw_fd_ostream OSRelations("relations.tsv", EC, llvm::sys::fs::OF_Text);
+
 
 llvm::raw_ostream &operator<<(llvm::raw_ostream &OS, const IndexFileOut &O) {
   switch (O.Format) {
@@ -685,9 +692,183 @@ llvm::raw_ostream &operator<<(llvm::raw_ostream &OS, const IndexFileOut &O) {
     break;
   case IndexFileFormat::YAML:
     writeYAML(O, OS);
+    writeTSV(O, OSSymbols, OSRefs, OSRelations);
     break;
   }
   return OS;
+}
+
+void writeTSV(const IndexFileOut &O, llvm::raw_ostream &OSSymbols, llvm::raw_ostream &OSRefs, llvm::raw_ostream &OSRelations) {
+  // Helper function to escape special characters in strings
+  auto escapeString = [](llvm::StringRef str) -> std::string {
+    std::string result;
+    result.reserve(str.size());
+    for (char c : str) {
+      switch (c) {
+        case '\'': result += "\'\'"; break;
+        case '\\': result += "\\\\"; break;
+        case '\n': result += "\\n"; break;
+        case '\r': result += "\\r"; break;
+        case '\t': result += "\\t"; break;
+        default: result += c;
+      }
+    }
+    return result;
+  };
+
+  // Helper to format location
+  auto formatLocation = [&escapeString](const SymbolLocation &Loc) -> std::string {
+    if (!Loc) return "''\t0\t0\t0\t0";
+    return "'" + 
+            escapeString(Loc.FileURI) + "'\t" +
+            std::to_string(Loc.Start.line()) + "\t" +
+            std::to_string(Loc.Start.column()) + "\t" +
+            std::to_string(Loc.End.line()) + "\t" +
+            std::to_string(Loc.End.column());
+  };
+
+  auto symbolKindToString = [](index::SymbolKind Kind) -> std::string {
+    switch (Kind) {
+      case index::SymbolKind::Unknown: return "Unknown";
+      case index::SymbolKind::Module: return "Module";
+      case index::SymbolKind::Namespace: return "Namespace";
+      case index::SymbolKind::NamespaceAlias: return "NamespaceAlias";
+      case index::SymbolKind::Macro: return "Macro";
+      case index::SymbolKind::Enum: return "Enum";
+      case index::SymbolKind::Struct: return "Struct";
+      case index::SymbolKind::Class: return "Class";
+      case index::SymbolKind::Protocol: return "Protocol";
+      case index::SymbolKind::Extension: return "Extension";
+      case index::SymbolKind::Union: return "Union";
+      case index::SymbolKind::TypeAlias: return "TypeAlias";
+      case index::SymbolKind::Function: return "Function";
+      case index::SymbolKind::Variable: return "Variable";
+      case index::SymbolKind::Field: return "Field";
+      case index::SymbolKind::EnumConstant: return "EnumConstant";
+      case index::SymbolKind::InstanceMethod: return "InstanceMethod";
+      case index::SymbolKind::ClassMethod: return "ClassMethod";
+      case index::SymbolKind::StaticMethod: return "StaticMethod";
+      case index::SymbolKind::InstanceProperty: return "InstanceProperty";
+      case index::SymbolKind::ClassProperty: return "ClassProperty";
+      case index::SymbolKind::StaticProperty: return "StaticProperty";
+      case index::SymbolKind::Constructor: return "Constructor";
+      case index::SymbolKind::Destructor: return "Destructor";
+      case index::SymbolKind::ConversionFunction: return "ConversionFunction";
+      case index::SymbolKind::Parameter: return "Parameter";
+      case index::SymbolKind::Using: return "Using";
+      case index::SymbolKind::Concept: return "Concept";
+      default: return "Unknown";
+    }
+  };
+
+    // Helper to convert SymbolLanguage to string
+  auto symbolLanguageToString = [](index::SymbolLanguage Lang) -> std::string {
+    switch (Lang) {
+      case index::SymbolLanguage::C: return "C";
+      case index::SymbolLanguage::CXX: return "Cpp";
+      case index::SymbolLanguage::ObjC: return "ObjC";
+      case index::SymbolLanguage::Swift: return "Swift";
+    }
+  };
+
+  auto formatMultilineWithComments = [](llvm::StringRef text) -> std::string {
+    if (text.empty()) return "";
+    
+    std::string result;
+    llvm::SmallVector<llvm::StringRef, 8> lines;
+    text.split(lines, '\n');
+    
+    for (const auto &line : lines) {
+      result += "// ";
+      result += line.str();
+      result += "\n";
+    }
+    
+    return result;
+  };
+
+  auto formatLocationComment = [](const SymbolLocation &Loc) -> std::string {
+    if (!Loc) return "";
+    return "// Location: " + std::string(Loc.FileURI) + 
+           " [" + std::to_string(Loc.Start.line()) + ":" + 
+           std::to_string(Loc.Start.column()) + " - " +
+           std::to_string(Loc.End.line()) + ":" +
+           std::to_string(Loc.End.column()) + "]\n";
+  };
+
+  for (const auto &Sym : *O.Symbols) {
+    const SymbolLocation &PrimaryLoc = Sym.Definition ? Sym.Definition : Sym.CanonicalDeclaration;
+    
+    std::string Body = formatLocationComment(PrimaryLoc);
+    
+    if (!Sym.Documentation.empty()) {
+      Body += "\n// Documentation:\n" + formatMultilineWithComments(Sym.Documentation.str());
+    }
+
+    // Add expanded form
+    if (!Sym.Body.empty()) {
+      Body += "// Expanded form:\n" + formatMultilineWithComments(Sym.Body);
+    }
+
+    // Add original source if available - add header but keep original formatting
+    if (!Sym.RealBody.empty()) {
+      Body += "//\n// Original source:\n\n" + Sym.RealBody;
+    }
+
+    OSSymbols << escapeString(Sym.ID.str()) << '\t'
+      << escapeString(Sym.Name.str()) << '\t'
+      << escapeString(Sym.Scope.str()) << '\t'
+      << escapeString(symbolKindToString(Sym.SymInfo.Kind)) << '\t'
+      << escapeString(symbolLanguageToString(Sym.SymInfo.Lang)) << '\t'
+      << formatLocation(Sym.CanonicalDeclaration) << '\t'
+      << formatLocation(Sym.Definition) << '\t'
+      << formatLocation(Sym.FullLocation) << '\t'
+      << escapeString(Body) << '\n';
+  }
+
+  auto refKindToString = [](RefKind Kind) -> std::string {
+    std::vector<std::string> Kinds;
+    if (static_cast<uint8_t>(Kind) & static_cast<uint8_t>(RefKind::Declaration))
+        Kinds.push_back("Declaration");
+    if (static_cast<uint8_t>(Kind) & static_cast<uint8_t>(RefKind::Definition))
+        Kinds.push_back("Definition");
+    if (static_cast<uint8_t>(Kind) & static_cast<uint8_t>(RefKind::Reference))
+        Kinds.push_back("Reference");
+    if (static_cast<uint8_t>(Kind) & static_cast<uint8_t>(RefKind::Spelled))
+        Kinds.push_back("Spelled");
+    return Kinds.empty() ? "Unknown" : llvm::join(Kinds, "|");
+  };
+
+  // Write references
+  if (O.Refs) {
+    for (const auto &RefsPair : *O.Refs) {
+      const SymbolID &ID = RefsPair.first;
+      const llvm::ArrayRef<clang::clangd::Ref> &Refs = RefsPair.second;
+
+      for (const Ref &R : Refs) {
+        OSRefs << escapeString(ID.str()) << '\t'
+          << escapeString(refKindToString(R.Kind)) << '\t'
+          << formatLocation(R.Location) << '\t'
+          << (R.Container.isNull() ? "NULL" : escapeString(R.Container.str())) << '\n';
+      }
+    }
+  }
+
+  auto relationKindToString = [](RelationKind Kind) -> std::string {
+    switch (Kind) {
+      case RelationKind::BaseOf: return "BaseOf";
+      case RelationKind::OverriddenBy: return "OverriddenBy";
+    }
+  };
+
+  // Write relations
+  if (O.Relations) {
+    for (const auto &Rel : *O.Relations) {
+      OSRelations << escapeString(Rel.Subject.str()) << '\t'
+        << escapeString(relationKindToString(Rel.Predicate)) << '\t'
+        << escapeString(Rel.Object.str()) << '\n';
+    }
+  }
 }
 
 llvm::Expected<IndexFileIn> readIndexFile(llvm::StringRef Data,
